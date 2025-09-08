@@ -1,3 +1,8 @@
+"""
+Process Information Collector Module
+Refactored from process_list.py for better integration
+"""
+
 import os
 import sys
 import json
@@ -5,8 +10,6 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-
-OUT_FILE = "ProcessList.txt"
 
 def write_blocks(path: Path, rows: List[Dict[str, Any]]) -> None:
     with open(path, "w", encoding="utf-8") as f:
@@ -99,10 +102,11 @@ def fetch_via_wmic() -> Optional[List[Dict[str, Any]]]:
     except Exception:
         return None
 
-def main() -> int:
+def collect_processes(output_file: str):
+    """Collect running processes information and save to file"""
     if os.name != "nt":
         print("This script must be run on Windows.")
-        return 1
+        return False
 
     rows = (
         fetch_via_powershell()
@@ -118,10 +122,7 @@ def main() -> int:
             return 0
     rows.sort(key=_pid)
 
-    out_path = Path(OUT_FILE)
+    out_path = Path(output_file)
     write_blocks(out_path, rows)
     print(f"[Done] Wrote {out_path.resolve()} with {len(rows)} processes.")
-    return 0
-
-if __name__ == "__main__":
-    sys.exit(main())
+    return True

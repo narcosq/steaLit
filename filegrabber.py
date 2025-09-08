@@ -8,9 +8,6 @@ from docx import Document              # python-docx
 from openpyxl import load_workbook
 from pdfminer.high_level import extract_text as pdf_extract_text
 
-# ------------------------------
-# Config
-# ------------------------------
 SCAN_FOLDER = input("Enter folder to scan: ").strip().strip('"')
 OUTPUT_FOLDER = "FileGrabber"  # destination root
 KEYWORDS = ["password", "secret", "token", "key", "api"]
@@ -22,10 +19,8 @@ TEXT_EXTS = {
 }
 
 def bytes_keyword_hits(path, keywords, chunk_size=1024 * 1024):
-    """Scan arbitrary binary file in chunks; return hit offsets (approx)."""
     hits = []
     try:
-        # pre encode keywords as ascii/utf-8 lowercase byte sets
         kw_bytes = [k.encode("utf-8").lower() for k in keywords]
         with open(path, "rb") as f:
             offset = 0
